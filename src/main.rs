@@ -3,12 +3,10 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use clap::Parser;
 use color_eyre::eyre::Result;
 use kdl::KdlDocument;
+
 use niri_ipc::{Event, Request, Response, Window, socket::Socket};
-use notify::{INotifyWatcher, Watcher};
-use tokio::sync::{
-    RwLock,
-    mpsc::{Receiver, Sender, channel},
-};
+use notify::Watcher;
+use tokio::sync::{RwLock, mpsc::channel};
 
 #[derive(Parser)]
 struct Cli {
@@ -19,6 +17,7 @@ struct Cli {
 struct EventsState {
     document: Arc<RwLock<KdlDocument>>,
     windows: HashMap<u64, Window>,
+    last_focused: u64,
 }
 
 impl EventsState {
@@ -26,6 +25,7 @@ impl EventsState {
         Self {
             document: doc,
             windows: HashMap::new(),
+            last_focused: u64::MAX,
         }
     }
 
@@ -104,7 +104,12 @@ impl EventsState {
                     self.handle_events_of(&window, "on-change").await;
                 }
                 Event::WindowFocusChanged { id } if let Some(id) = id => {
+                    if self.last_focused != u64::MAX {
+                        self.handle_events_of(self.window(self.last_focused), "on-unfocus")
+                            .await;
+                    }
                     self.handle_events_of(self.window(id), "on-focus").await;
+                    self.last_focused = id;
                 }
                 Event::OverviewOpenedOrClosed { is_open } if is_open => {
                     self.handle_events_for_node("overview", "on-open").await;
