@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 use clap::Parser;
 use color_eyre::eyre::Result;
@@ -11,31 +11,38 @@ struct Cli {
     path: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let config = Cli::parse();
-    let path = config.path.map(|v| PathBuf::from(v)).unwrap_or(
-        std::env::home_dir()
-            .expect("Should contain a home dir")
-            .join(".config")
-            .join("niri")
-            .join("events.kdl"),
-    );
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return Ok(());
-    };
+struct EventsState {
+    socket: Socket,
+    document: KdlDocument,
+    ids: HashSet<u64>,
+}
 
-    let document: KdlDocument = content.parse()?;
-
-    let mut socket = Socket::connect()?;
-    if let Ok(Response::Handled) = socket.send(Request::EventStream)? {
-        let mut reader = socket.read_events();
+impl EventsState {
+    pub fn new(doc: KdlDocument) -> Result<Self> {
+        Ok(Self {
+            document: doc,
+            socket: Socket::connect()?,
+            ids: HashSet::new(),
+        })
+    }
+    pub fn run(mut self) -> Result<()> {
+        let Ok(Response::Handled) = self.socket.send(Request::EventStream)? else {
+            return Ok(());
+        };
+        let mut reader = self.socket.read_events();
         while let Ok(event) = reader() {
             match event {
+                Event::WindowClosed { id } => {
+                    self.ids.remove(&id);
+                }
                 Event::WindowOpenedOrChanged { window }
                     if let Some(ref id) = window.app_id
-                        && let Some(document) = document.get(id) =>
+                        && let Some(document) = self.document.get(id) =>
                 {
+                    if self.ids.contains(&window.id) {
+                        continue;
+                    }
+                    self.ids.insert(window.id);
                     let Some(children) = document.children() else {
                         continue;
                     };
@@ -69,6 +76,25 @@ async fn main() -> Result<()> {
                 _ => {}
             }
         }
+        Ok(())
     }
-    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let config = Cli::parse();
+    let path = config.path.map(|v| PathBuf::from(v)).unwrap_or(
+        std::env::home_dir()
+            .expect("Should contain a home dir")
+            .join(".config")
+            .join("niri")
+            .join("events.kdl"),
+    );
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+
+    let document: KdlDocument = content.parse()?;
+    let state = EventsState::new(document)?;
+    state.run()
 }
