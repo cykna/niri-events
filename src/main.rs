@@ -19,6 +19,11 @@ struct EventsState {
     windows: HashMap<u64, Window>,
 }
 
+enum WindowIdentifier<'a> {
+    Str(&'a str),
+    Numeric(u64),
+}
+
 impl EventsState {
     pub fn new(doc: KdlDocument) -> Self {
         Self {
@@ -30,14 +35,13 @@ impl EventsState {
     fn did_window_spawn(&self, id: u64) -> bool {
         !self.windows.contains_key(&id)
     }
+    fn window(&self, id: u64) -> &Window {
+        self.windows
+            .get(&id)
+            .expect("Window with the provided id should be mapped")
+    }
 
-    pub fn handle_events_of(&self, window: Window, handler: &str) {
-        let node = match () {
-            _ if let Some(id) = window.app_id => id,
-            _ if let Some(title) = window.title => title,
-            _ if let Some(pid) = window.pid => pid.to_string(),
-            _ => window.id.to_string(),
-        };
+    pub fn handle_events_for_node(&self, node: &str, handler: &str) {
         if let Some(doc) = self.document.get(&node)
             && let Some(children) = doc.children()
             && let Some(children) = children.get(handler).map(|node| node.children()).flatten()
@@ -63,8 +67,25 @@ impl EventsState {
         };
     }
 
+    pub fn handle_events_of(&self, window: &Window, handler: &str) {
+        let node = match () {
+            _ if let Some(ref id) = window.app_id => id.clone(),
+            _ if let Some(ref title) = window.title => title.clone(),
+            _ if let Some(ref pid) = window.pid => pid.to_string(),
+            _ => window.id.to_string(),
+        };
+        self.handle_events_for_node(&node, handler);
+    }
+
     pub fn run(mut self) -> Result<()> {
         let mut socket = Socket::connect()?;
+        let windows = socket.send(Request::Windows)?;
+        if let Response::Windows(windows) = windows.map_err(|e| color_eyre::Report::msg(e))? {
+            for window in windows {
+                println!("{}", window.id);
+                self.windows.insert(window.id, window);
+            }
+        }
         let Ok(Response::Handled) = socket.send(Request::EventStream)? else {
             return Ok(());
         };
@@ -76,16 +97,26 @@ impl EventsState {
                         eprintln!("Window should be mapped");
                         continue;
                     };
-                    self.handle_events_of(window.clone(), "on-close");
+                    self.handle_events_of(window, "on-close");
                     self.windows.remove(&id);
                 }
                 Event::WindowOpenedOrChanged { window } if self.did_window_spawn(window.id) => {
-                    self.handle_events_of(window.clone(), "on-spawn");
+                    self.handle_events_of(&window, "on-spawn");
                     self.windows.insert(window.id, window);
                 }
                 Event::WindowOpenedOrChanged { window } if !self.did_window_spawn(window.id) => {
-                    self.handle_events_of(window, "on-change")
+                    self.handle_events_of(&window, "on-change")
                 }
+                Event::WindowFocusChanged { id } if let Some(id) = id => {
+                    self.handle_events_of(self.window(id), "on-focus")
+                }
+                Event::OverviewOpenedOrClosed { is_open } if is_open => {
+                    self.handle_events_for_node("overview", "on-open")
+                }
+                Event::OverviewOpenedOrClosed { is_open } if !is_open => {
+                    self.handle_events_for_node("overview", "on-close")
+                }
+
                 _ => {}
             }
         }
