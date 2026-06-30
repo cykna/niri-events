@@ -1,12 +1,14 @@
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use clap::Parser;
 use color_eyre::eyre::Result;
 use kdl::KdlDocument;
 use niri_ipc::{Event, Request, Response, Window, socket::Socket};
+use notify::{INotifyWatcher, Watcher};
+use tokio::sync::{
+    RwLock,
+    mpsc::{Receiver, Sender, channel},
+};
 
 #[derive(Parser)]
 struct Cli {
@@ -15,17 +17,12 @@ struct Cli {
 }
 
 struct EventsState {
-    document: KdlDocument,
+    document: Arc<RwLock<KdlDocument>>,
     windows: HashMap<u64, Window>,
 }
 
-enum WindowIdentifier<'a> {
-    Str(&'a str),
-    Numeric(u64),
-}
-
 impl EventsState {
-    pub fn new(doc: KdlDocument) -> Self {
+    pub fn new(doc: Arc<RwLock<KdlDocument>>) -> Self {
         Self {
             document: doc,
             windows: HashMap::new(),
@@ -41,8 +38,8 @@ impl EventsState {
             .expect("Window with the provided id should be mapped")
     }
 
-    pub fn handle_events_for_node(&self, node: &str, handler: &str) {
-        if let Some(doc) = self.document.get(&node)
+    pub async fn handle_events_for_node(&self, node: &str, handler: &str) {
+        if let Some(doc) = self.document.read().await.get(&node)
             && let Some(children) = doc.children()
             && let Some(children) = children.get(handler).map(|node| node.children()).flatten()
         {
@@ -67,22 +64,21 @@ impl EventsState {
         };
     }
 
-    pub fn handle_events_of(&self, window: &Window, handler: &str) {
+    pub async fn handle_events_of(&self, window: &Window, handler: &str) {
         let node = match () {
             _ if let Some(ref id) = window.app_id => id.clone(),
             _ if let Some(ref title) = window.title => title.clone(),
             _ if let Some(ref pid) = window.pid => pid.to_string(),
             _ => window.id.to_string(),
         };
-        self.handle_events_for_node(&node, handler);
+        self.handle_events_for_node(&node, handler).await;
     }
 
-    pub fn run(mut self) -> Result<()> {
+    pub async fn run(mut self) -> Result<()> {
         let mut socket = Socket::connect()?;
         let windows = socket.send(Request::Windows)?;
         if let Response::Windows(windows) = windows.map_err(|e| color_eyre::Report::msg(e))? {
             for window in windows {
-                println!("{}", window.id);
                 self.windows.insert(window.id, window);
             }
         }
@@ -97,24 +93,24 @@ impl EventsState {
                         eprintln!("Window should be mapped");
                         continue;
                     };
-                    self.handle_events_of(window, "on-close");
+                    self.handle_events_of(window, "on-close").await;
                     self.windows.remove(&id);
                 }
                 Event::WindowOpenedOrChanged { window } if self.did_window_spawn(window.id) => {
-                    self.handle_events_of(&window, "on-spawn");
+                    self.handle_events_of(&window, "on-spawn").await;
                     self.windows.insert(window.id, window);
                 }
                 Event::WindowOpenedOrChanged { window } if !self.did_window_spawn(window.id) => {
-                    self.handle_events_of(&window, "on-change")
+                    self.handle_events_of(&window, "on-change").await;
                 }
                 Event::WindowFocusChanged { id } if let Some(id) = id => {
-                    self.handle_events_of(self.window(id), "on-focus")
+                    self.handle_events_of(self.window(id), "on-focus").await;
                 }
                 Event::OverviewOpenedOrClosed { is_open } if is_open => {
-                    self.handle_events_for_node("overview", "on-open")
+                    self.handle_events_for_node("overview", "on-open").await;
                 }
                 Event::OverviewOpenedOrClosed { is_open } if !is_open => {
-                    self.handle_events_for_node("overview", "on-close")
+                    self.handle_events_for_node("overview", "on-close").await;
                 }
 
                 _ => {}
@@ -134,11 +130,30 @@ async fn main() -> Result<()> {
             .join("niri")
             .join("events.kdl"),
     );
-    let Ok(content) = std::fs::read_to_string(path) else {
+    let Ok(content) = std::fs::read_to_string(&path) else {
         return Ok(());
     };
-
     let document: KdlDocument = content.parse()?;
-    let state = EventsState::new(document);
-    state.run()
+    let document = Arc::new(RwLock::new(document));
+    let (tx, mut rx) = channel(1);
+    let mut notifier = notify::recommended_watcher(move |event: Result<notify::Event, _>| {
+        if let Ok(event) = event
+            && let notify::EventKind::Modify(_) = event.kind
+        {
+            let _ = tx.blocking_send(());
+        }
+    })?;
+    notifier.watch(&path, notify::RecursiveMode::NonRecursive)?;
+    let state = EventsState::new(document.clone());
+    tokio::spawn(async move {
+        while let Some(_) = rx.recv().await {
+            if let Ok(content) = tokio::fs::read_to_string(&path).await
+                && let Ok(doc) = content.parse()
+            {
+                *document.write().await = doc;
+                println!("re-executing");
+            }
+        }
+    });
+    state.run().await
 }
