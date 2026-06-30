@@ -76,6 +76,9 @@ impl EventsState {
                     self.ids.insert(window.id);
                     self.handle_events_of(window, "on-spawn");
                 }
+                Event::WindowOpenedOrChanged { window } if !self.did_window_spawn(window.id) => {
+                    self.handle_events_of(window, "on-change")
+                }
                 _ => {}
             }
         }
