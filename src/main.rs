@@ -1,4 +1,7 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use clap::Parser;
 use color_eyre::eyre::Result;
@@ -13,20 +16,19 @@ struct Cli {
 
 struct EventsState {
     document: KdlDocument,
-    ids: HashSet<u64>,
+    windows: HashMap<u64, Window>,
 }
 
 impl EventsState {
     pub fn new(doc: KdlDocument) -> Self {
         Self {
             document: doc,
-
-            ids: HashSet::new(),
+            windows: HashMap::new(),
         }
     }
 
     fn did_window_spawn(&self, id: u64) -> bool {
-        !self.ids.contains(&id)
+        !self.windows.contains_key(&id)
     }
 
     pub fn handle_events_of(&self, window: Window, handler: &str) {
@@ -70,11 +72,16 @@ impl EventsState {
         while let Ok(event) = reader() {
             match event {
                 Event::WindowClosed { id } => {
-                    self.ids.remove(&id);
+                    let Some(window) = self.windows.get(&id) else {
+                        eprintln!("Window should be mapped");
+                        continue;
+                    };
+                    self.handle_events_of(window.clone(), "on-close");
+                    self.windows.remove(&id);
                 }
                 Event::WindowOpenedOrChanged { window } if self.did_window_spawn(window.id) => {
-                    self.ids.insert(window.id);
-                    self.handle_events_of(window, "on-spawn");
+                    self.handle_events_of(window.clone(), "on-spawn");
+                    self.windows.insert(window.id, window);
                 }
                 Event::WindowOpenedOrChanged { window } if !self.did_window_spawn(window.id) => {
                     self.handle_events_of(window, "on-change")
